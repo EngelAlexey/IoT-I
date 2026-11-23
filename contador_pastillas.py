@@ -1,12 +1,9 @@
 # ================================================================================================
-# SmartPill Counter - Conteo de pastillas con Camera Module 3 + Raspberry Pi 5
+# SmartPill Counter - Conteo de pastillas con Camera Module 3 / v1.3 + Raspberry Pi 4 + 2 Servos SG90
 # Curso: ITIEL-11 Internet de las cosas - UTN Pacífico
 #
-# Hardware : Raspberry Pi 5 + Camera Module 3 (puerto CAM/DISP 0) + monitor HDMI (micro-HDMI 0)
-# Software : Python 3, Picamera2, OpenCV, Flask, SQLite
-#
-# Instalación (igual que en class_03):
-#   sudo apt install -y python3-flask python3-opencv python3-picamera2 python3-full
+# Hardware : Raspberry Pi 4 + Cámara (puerto CAMERA) + monitor HDMI (micro-HDMI 0) + 2 servos SG90
+# Software : Python 3, Picamera2, OpenCV, Flask, SQLite, gpiozero
 #
 # Uso:
 #   python3 contador_pastillas.py
@@ -15,7 +12,7 @@
 #
 # Teclas en la ventana del monitor:
 #   0-9  escribir cantidad objetivo     Enter  confirmar objetivo
-#   c    capturar y contar (congela)     r      volver al conteo en vivo
+#   c    vibrar, capturar y contar      r      volver al conteo en vivo
 #   +/-  ajustar umbral manual           a      umbral automático (Otsu)
 #   s    guardar registro en SQLite      q      salir
 # ================================================================================================
@@ -32,11 +29,17 @@ from flask import Flask, Response, jsonify, render_template_string, request
 try:
     from picamera2 import Picamera2
     USAR_PICAMERA = True
-except ImportError:          # Permite probar en una PC con cámara web (etapa 2 del plan)
+except ImportError:
     USAR_PICAMERA = False
 
+try:
+    from gpiozero import AngularServo
+    USAR_SERVO = True
+except ImportError:
+    USAR_SERVO = False
+
 # ------------------------------------------------------------------------------------------------
-# Configuración (calibrar con la bandeja y la iluminación reales)
+# Configuración (calibrar con la bandeja, iluminación y montaje de servos reales)
 # ------------------------------------------------------------------------------------------------
 RESOLUCION = (1280, 720)
 ROI = None                   # Región de la bandeja (x, y, ancho, alto). None = imagen completa
@@ -47,6 +50,10 @@ SEPARACION_WATERSHED = 0.6   # 0.4-0.8: más alto separa más agresivamente past
 LECTURAS_ESTABLES = 5        # Mediana de N cuadros para evitar parpadeo del conteo
 DB = "smartpill.db"
 MOSTRAR_EN_MONITOR = True    # Ventana OpenCV en el monitor HDMI
+
+PINES_SERVO = [18, 13]       # Servo 1 en GPIO 18 (pin físico 12) y Servo 2 en GPIO 13 (pin físico 33)
+CICLOS_VIBRACION = 6         # Cantidad de sacudidas rápidas antes de contar
+AMPLITUD_VIBRACION = 15      # Grados de giro a cada lado (ajustar según el soporte)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -85,11 +92,11 @@ class Camara:
                 main={"size": RESOLUCION, "format": "RGB888"})
             self.picam2.configure(config)
             self.picam2.start()
-            try:   # Camera Module 3 tiene autofocus: enfoque continuo
+            try:
                 self.picam2.set_controls({"AfMode": 2})
             except Exception as e:
                 print(f"Nota sobre autofocus: {e}")
-            time.sleep(2)  # Estabilizar exposición y balance de blancos
+            time.sleep(2)
         else:
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUCION[0])
@@ -97,7 +104,6 @@ class Camara:
 
     def leer(self):
         if USAR_PICAMERA:
-            # Con "RGB888" Picamera2 entrega los bytes en orden BGR, que es el nativo de OpenCV
             return self.picam2.capture_array()
         ok, frame = self.cap.read()
         return frame if ok else None
@@ -110,11 +116,68 @@ class Camara:
 
 
 # ------------------------------------------------------------------------------------------------
+# Vibración de bandeja con 2 servos SG90
+# ------------------------------------------------------------------------------------------------
+class VibradorBandeja:
+    def __init__(self, pines=PINES_SERVO):
+        self.servos = []
+        if USAR_SERVO:
+            for pin in pines:
+                try:
+                    s = AngularServo(
+                        pin,
+                        min_angle=-90,
+                        max_angle=90,
+                        min_pulse_width=0.0005,
+                        max_pulse_width=0.0025
+                    )
+                    s.angle = 0
+                    self.servos.append(s)
+                except Exception as e:
+                    print(f"Aviso servo en GPIO {pin}: {e}")
+            if self.servos:
+                time.sleep(0.2)
+                for s in self.servos:
+                    s.detach()
+
+    def vibrar(self):
+        """Sacude la bandeja con ambos servos antes de capturar el conteo."""
+        if not self.servos:
+            return
+        for i in range(CICLOS_VIBRACION):
+            sentido = 1 if i % 2 == 0 else -1
+            for idx, s in enumerate(self.servos):
+                fase = sentido if idx == 0 else -sentido
+                s.angle = fase * AMPLITUD_VIBRACION
+            time.sleep(0.06)
+
+            for idx, s in enumerate(self.servos):
+                fase = -sentido if idx == 0 else sentido
+                s.angle = fase * AMPLITUD_VIBRACION
+            time.sleep(0.06)
+
+        for s in self.servos:
+            s.angle = 0
+        time.sleep(0.15)
+        for s in self.servos:
+            s.detach()
+        time.sleep(0.25)
+
+    def cerrar(self):
+        for s in self.servos:
+            try:
+                s.detach()
+                s.close()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------------------------------------
 # Visión: segmentación + watershed para separar pastillas que se tocan
 # ------------------------------------------------------------------------------------------------
 class Contador:
     def __init__(self):
-        self.umbral_manual = None   # None = Otsu automático
+        self.umbral_manual = None
 
     def contar(self, frame):
         """Devuelve (cantidad, imagen_anotada, mascara)."""
@@ -124,28 +187,22 @@ class Contador:
             x0, y0, w, h = ROI
             zona = frame[y0:y0 + h, x0:x0 + w]
 
-        # 1. Escala de grises + normalización de iluminación
         gris = cv2.cvtColor(zona, cv2.COLOR_BGR2GRAY)
         gris = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gris)
         gris = cv2.GaussianBlur(gris, (7, 7), 0)
 
-        # 2. Separar objetos del fondo
         tipo = cv2.THRESH_BINARY if FONDO_OSCURO else cv2.THRESH_BINARY_INV
         if self.umbral_manual is None:
             _, mascara = cv2.threshold(gris, 0, 255, tipo + cv2.THRESH_OTSU)
         else:
             _, mascara = cv2.threshold(gris, self.umbral_manual, 255, tipo)
 
-        # 3. Limpiar ruido
         kernel = np.ones((3, 3), np.uint8)
         mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=2)
         mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # 4. Watershed: transformada de distancia -> marcadores -> separación
         fondo_seguro = cv2.dilate(mascara, kernel, iterations=3)
         dist = cv2.distanceTransform(mascara, cv2.DIST_L2, 5)
-        # Umbral relativo al máximo de CADA mancha (no al global), así pastillas
-        # pequeñas o de distinto tamaño también generan su propio marcador
         frente_seguro = np.zeros_like(mascara)
         n_blobs, blobs = cv2.connectedComponents(mascara)
         for b in range(1, n_blobs):
@@ -159,7 +216,6 @@ class Contador:
         marcadores[desconocido == 255] = 0
         marcadores = cv2.watershed(zona.copy(), marcadores)
 
-        # 5. Contar regiones válidas por área
         anotada = frame.copy()
         cantidad = 0
         for etiqueta in range(2, n_marcas + 1):
@@ -193,6 +249,7 @@ class Estado:
         self.objetivo = 30
         self.detectadas = 0
         self.congelado = False
+        self.solicitar_captura = False
         self.jpeg = None
         self.historial = []
 
@@ -207,10 +264,10 @@ class Estado:
 
 estado = Estado()
 contador = Contador()
+vibrador = VibradorBandeja()
 
 
 def dibujar_panel(img, entrada_objetivo):
-    """Panel con objetivo, detectadas y diferencia (sección 11 del documento)."""
     est, msg, color = estado.resultado()
     h, w = img.shape[:2]
     cv2.rectangle(img, (0, 0), (w, 95), (30, 30, 30), -1)
@@ -231,12 +288,38 @@ def dibujar_panel(img, entrada_objetivo):
     return img
 
 
+def ejecutar_captura_con_vibracion(cam):
+    vibrador.vibrar()
+    estado.congelado = False
+    ultimo_frame = None
+    lecturas = []
+    for _ in range(LECTURAS_ESTABLES):
+        f = cam.leer()
+        if f is not None:
+            n, anotada, _ = contador.contar(f)
+            lecturas.append(n)
+            ultimo_frame = anotada
+    with estado.lock:
+        if lecturas:
+            estado.historial = (estado.historial + lecturas)[-LECTURAS_ESTABLES:]
+            estado.detectadas = int(np.median(lecturas))
+        estado.congelado = True
+    return ultimo_frame
+
+
 def bucle_camara():
     cam = Camara()
     entrada = ""
     ultimo = None
     try:
         while True:
+            if estado.solicitar_captura:
+                with estado.lock:
+                    estado.solicitar_captura = False
+                captura = ejecutar_captura_con_vibracion(cam)
+                if captura is not None:
+                    ultimo = captura
+
             if not estado.congelado or ultimo is None:
                 frame = cam.leer()
                 if frame is None:
@@ -259,21 +342,15 @@ def bucle_camara():
                     break
                 elif ord("0") <= tecla <= ord("9"):
                     entrada += chr(tecla)
-                elif tecla in (13, 10) and entrada:          # Enter
+                elif tecla in (13, 10) and entrada:
                     estado.objetivo = int(entrada)
                     entrada = ""
-                elif tecla == 8:                             # Backspace
+                elif tecla == 8:
                     entrada = entrada[:-1]
                 elif tecla == ord("c"):
-                    estado.congelado, ultimo = False, None   # Fuerza una lectura nueva...
-                    estado.historial = []
-                    for _ in range(LECTURAS_ESTABLES):       # ...promediada, y congela
-                        f = cam.leer()
-                        if f is not None:
-                            n, ultimo, _ = contador.contar(f)
-                            estado.historial.append(n)
-                    estado.detectadas = int(np.median(estado.historial))
-                    estado.congelado = True
+                    captura = ejecutar_captura_con_vibracion(cam)
+                    if captura is not None:
+                        ultimo = captura
                 elif tecla == ord("r"):
                     estado.congelado = False
                 elif tecla == ord("+"):
@@ -289,6 +366,7 @@ def bucle_camara():
             else:
                 time.sleep(0.03)
     finally:
+        vibrador.cerrar()
         cam.cerrar()
         cv2.destroyAllWindows()
 
@@ -374,7 +452,9 @@ def api_objetivo():
 
 @app.route("/capturar", methods=["POST"])
 def api_capturar():
-    estado.congelado = True     # Congela el último conteo estable
+    with estado.lock:
+        estado.solicitar_captura = True
+    time.sleep(1.3)
     return jsonify(ok=True, detectadas=estado.detectadas)
 
 
@@ -398,7 +478,7 @@ def api_registros():
 
 if __name__ == "__main__":
     init_db()
-    # Flask en un hilo secundario; la ventana de OpenCV debe ir en el hilo principal
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, debug=False,
                                             use_reloader=False), daemon=True).start()
     bucle_camara()
+    
