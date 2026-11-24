@@ -41,7 +41,7 @@ except ImportError:
 # ------------------------------------------------------------------------------------------------
 # Configuración (calibrar con la bandeja, iluminación y montaje de servos reales)
 # ------------------------------------------------------------------------------------------------
-RESOLUCION = (1280, 720)
+RESOLUCION = (640, 480)      # Más estable en Raspberry Pi 4 + cámara rev 1.3 (puedes subir a 800x600)
 ROI = None                   # Región de la bandeja (x, y, ancho, alto). None = usa MARGEN_BORDE
 MARGEN_BORDE = 0.06          # Ignora el 6% de los bordes si ROI es None
 FONDO_OSCURO = True          # True: pastillas claras sobre fondo oscuro/mate
@@ -51,8 +51,8 @@ SEPARACION_WATERSHED = 0.55  # 0.4-0.8: más alto separa más agresivamente past
 LECTURAS_ESTABLES = 5        # Mediana de N cuadros para evitar parpadeo del conteo
 DB = "smartpill.db"
 MOSTRAR_EN_MONITOR = True    # Ventana OpenCV en el monitor HDMI
-ANCHO_VENTANA = 960          # None para tamaño original; ej. 960 para ajustar en pantalla
-ALTO_VENTANA = 540
+ANCHO_VENTANA = 800          # None para tamaño original; ej. 800 para ajustar en pantalla
+ALTO_VENTANA = 600
 
 PINES_SERVO = [18, 13]       # Servo 1 en GPIO 18 (pin físico 12) y Servo 2 en GPIO 13 (pin físico 33)
 CICLOS_VIBRACION = 6         # Cantidad de sacudidas rápidas antes de contar
@@ -87,33 +87,43 @@ def ultimos_registros(n=20):
 # ------------------------------------------------------------------------------------------------
 # Cámara
 # ------------------------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------------------------
-# Cámara
-# ------------------------------------------------------------------------------------------------
 class Camara:
     def __init__(self):
         self.picam2 = None
         self.cap = None
         if USAR_PICAMERA:
-            self.picam2 = Picamera2()
-            config = self.picam2.create_video_configuration(
-                main={"size": RESOLUCION, "format": "BGR888"},
-                buffer_count=2
-            )
-            self.picam2.configure(config)
-            self.picam2.start()
-            time.sleep(1.5)
-        else:
+            try:
+                self.picam2 = Picamera2()
+                config = self.picam2.create_video_configuration(
+                    main={"size": RESOLUCION, "format": "BGR888"},
+                    buffer_count=2
+                )
+                self.picam2.configure(config)
+                self.picam2.start()
+                time.sleep(1.5)
+                print(f"[Camara] Picamera2 iniciada a {RESOLUCION}")
+            except Exception as e:
+                print(f"[ERROR Camara] Falló Picamera2: {e}")
+                self.picam2 = None
+
+        if self.picam2 is None:
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUCION[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUCION[1])
+            print(f"[Camara] Usando VideoCapture(0) a {RESOLUCION}")
 
     def leer(self):
         """Captura y devuelve un frame en formato BGR de OpenCV."""
-        if USAR_PICAMERA and self.picam2:
-            # Picamera2 devuelve el frame en BGR888 configurado previamente
-            return self.picam2.capture_array()
-        elif self.cap:
+        if self.picam2 is not None:
+            try:
+                frame = self.picam2.capture_array()
+                if frame is not None and frame.ndim == 3 and frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                return frame
+            except Exception as e:
+                print(f"[WARN Camara] Error al leer frame de Picamera2: {e}")
+                return None
+        elif self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
                 return frame
@@ -121,17 +131,18 @@ class Camara:
 
     def cerrar(self):
         """Libera los recursos de la cámara de forma segura."""
-        if USAR_PICAMERA and self.picam2:
+        if self.picam2 is not None:
             try:
                 self.picam2.stop()
                 self.picam2.close()
             except Exception:
                 pass
-        elif self.cap:
+        if self.cap is not None:
             try:
                 self.cap.release()
             except Exception:
                 pass
+
 
 # ------------------------------------------------------------------------------------------------
 # Vibración de bandeja con 2 servos SG90
@@ -354,6 +365,14 @@ def dibujar_panel(img, entrada_objetivo):
     return img
 
 
+def frame_sin_senal():
+    lienzo = np.zeros((RESOLUCION[1], RESOLUCION[0], 3), dtype=np.uint8)
+    lienzo[:] = (25, 25, 35)
+    cv2.putText(lienzo, "Esperando senal de camara...", (40, RESOLUCION[1] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2)
+    return dibujar_panel(lienzo, "")
+
+
 def ejecutar_captura_con_vibracion(cam):
     vibrador.vibrar()
     estado.congelado = False
@@ -376,7 +395,13 @@ def ejecutar_captura_con_vibracion(cam):
 def bucle_camara():
     cam = Camara()
     entrada = ""
-    ultimo = None
+    ultimo = frame_sin_senal()
+
+    ok_init, buf_init = cv2.imencode(".jpg", ultimo, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if ok_init:
+        with estado.lock:
+            estado.jpeg = buf_init.tobytes()
+            estado.frame_id += 1
 
     if MOSTRAR_EN_MONITOR:
         cv2.namedWindow("SmartPill Counter", cv2.WINDOW_NORMAL)
@@ -395,15 +420,17 @@ def bucle_camara():
                 if captura is not None:
                     ultimo = captura
 
-            if not estado.congelado or ultimo is None:
+            if not estado.congelado:
                 frame = cam.leer()
-                if frame is None:
-                    continue
-                cantidad, anotada, _ = contador.contar(frame)
-                estado.historial = (estado.historial + [cantidad])[-LECTURAS_ESTABLES:]
-                with estado.lock:
-                    estado.detectadas = int(np.median(estado.historial))
-                ultimo = anotada
+                if frame is not None:
+                    cantidad, anotada, _ = contador.contar(frame)
+                    estado.historial = (estado.historial + [cantidad])[-LECTURAS_ESTABLES:]
+                    with estado.lock:
+                        estado.detectadas = int(np.median(estado.historial))
+                    ultimo = anotada
+                else:
+                    ultimo = frame_sin_senal()
+                    time.sleep(0.05)
 
             vista = dibujar_panel(ultimo.copy(), entrada)
             ok, buf = cv2.imencode(".jpg", vista, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
@@ -459,14 +486,14 @@ PAGINA = """
 <title>SmartPill Counter</title>
 <style>
  body{font-family:Arial,sans-serif;background:#1e1e2e;color:#cdd6f4;text-align:center;margin:0;padding:20px}
- h1{color:#89b4fa} img{border:3px solid #89b4fa;border-radius:10px;max-width:100%}
+ h1{color:#89b4fa} img{border:3px solid #89b4fa;border-radius:10px;max-width:100%;min-height:240px;background:#181825}
  .datos{display:flex;gap:20px;justify-content:center;margin:15px 0;font-size:1.4em}
  .datos div{background:#313244;padding:10px 20px;border-radius:8px}
  #msg{font-size:1.6em;font-weight:bold} button,input{font-size:1em;padding:6px 12px;margin:4px}
  table{margin:20px auto;border-collapse:collapse} td,th{border:1px solid #45475a;padding:4px 10px}
 </style></head><body>
 <h1>SmartPill Counter</h1>
-<img src="/video_feed" alt="Cámara">
+<img id="stream" src="/video_feed" alt="Camara">
 <div class="datos">
  <div>Objetivo: <b id="obj">-</b></div><div>Detectadas: <b id="det">-</b></div>
  <div>Diferencia: <b id="dif">-</b></div></div>
