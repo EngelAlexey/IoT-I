@@ -55,6 +55,14 @@ PINES_SERVO = [18, 13]       # Servo 1 en GPIO 18 (pin físico 12) y Servo 2 en 
 CICLOS_VIBRACION = 6         # Cantidad de sacudidas rápidas antes de contar
 AMPLITUD_VIBRACION = 15      # Grados de giro a cada lado (ajustar según el soporte)
 
+# Configuración mejorada
+ROI = None                   # O ej. (60, 40, 520, 360) para recortar solo la bandeja
+MARGEN_BORDE = 0.06          # Ignora el 6% de los bordes si ROI es None
+FONDO_OSCURO = True          # True: pastillas claras sobre fondo oscuro/mate
+AREA_MIN_BASE = 180          # Calibrado para 640x480 (se escala solo en 1280x720)
+AREA_MAX_BASE = 12000
+SEPARACION_WATERSHED = 0.55
+
 
 # ------------------------------------------------------------------------------------------------
 # Base de datos (registro de operaciones)
@@ -181,26 +189,43 @@ class Contador:
 
     def contar(self, frame):
         """Devuelve (cantidad, imagen_anotada, mascara)."""
-        x0, y0 = 0, 0
-        zona = frame
+        h_img, w_img = frame.shape[:2]
+        escala_area = (w_img * h_img) / (640.0 * 480.0)
+        area_min = AREA_MIN_BASE * escala_area
+        area_max = AREA_MAX_BASE * escala_area
+
         if ROI:
             x0, y0, w, h = ROI
-            zona = frame[y0:y0 + h, x0:x0 + w]
-
-        gris = cv2.cvtColor(zona, cv2.COLOR_BGR2GRAY)
-        gris = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gris)
-        gris = cv2.GaussianBlur(gris, (7, 7), 0)
-
-        tipo = cv2.THRESH_BINARY if FONDO_OSCURO else cv2.THRESH_BINARY_INV
-        if self.umbral_manual is None:
-            _, mascara = cv2.threshold(gris, 0, 255, tipo + cv2.THRESH_OTSU)
         else:
-            _, mascara = cv2.threshold(gris, self.umbral_manual, 255, tipo)
+            x0 = int(w_img * MARGEN_BORDE)
+            y0 = int(h_img * MARGEN_BORDE)
+            w = w_img - 2 * x0
+            h = h_img - 2 * y0
+        zona = frame[y0:y0 + h, x0:x0 + w]
 
-        kernel = np.ones((3, 3), np.uint8)
+        # 1. Escala de grises + suavizado
+        gris = cv2.cvtColor(zona, cv2.COLOR_BGR2GRAY)
+        gris = cv2.GaussianBlur(gris, (5, 5), 0)
+
+        # 2. Top-Hat morfológico: elimina iluminación desigual y resalta solo objetos pequeños
+        kernel_luz = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+        if FONDO_OSCURO:
+            realce = cv2.morphologyEx(gris, cv2.MORPH_TOPHAT, kernel_luz)
+        else:
+            realce = cv2.morphologyEx(gris, cv2.MORPH_BLACKHAT, kernel_luz)
+
+        # 3. Umbralización sobre la imagen realzada
+        if self.umbral_manual is None:
+            _, mascara = cv2.threshold(realce, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, mascara = cv2.threshold(realce, self.umbral_manual, 255, cv2.THRESH_BINARY)
+
+        # 4. Limpiar ruido y rellenar huecos internos de cada pastilla
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=2)
         mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
 
+        # 5. Watershed para separar pastillas pegadas
         fondo_seguro = cv2.dilate(mascara, kernel, iterations=3)
         dist = cv2.distanceTransform(mascara, cv2.DIST_L2, 5)
         frente_seguro = np.zeros_like(mascara)
@@ -208,7 +233,8 @@ class Contador:
         for b in range(1, n_blobs):
             sel = blobs == b
             local_max = dist[sel].max()
-            frente_seguro[sel & (dist > SEPARACION_WATERSHED * local_max)] = 255
+            if local_max > 0:
+                frente_seguro[sel & (dist > SEPARACION_WATERSHED * local_max)] = 255
         desconocido = cv2.subtract(fondo_seguro, frente_seguro)
 
         n_marcas, marcadores = cv2.connectedComponents(frente_seguro)
@@ -216,6 +242,7 @@ class Contador:
         marcadores[desconocido == 255] = 0
         marcadores = cv2.watershed(zona.copy(), marcadores)
 
+        # 6. Filtrar regiones válidas por área y forma compacta (descarta bordes largos)
         anotada = frame.copy()
         cantidad = 0
         for etiqueta in range(2, n_marcas + 1):
@@ -225,18 +252,25 @@ class Contador:
                 continue
             c = max(contornos, key=cv2.contourArea)
             area = cv2.contourArea(c)
-            if AREA_MIN <= area <= AREA_MAX:
-                cantidad += 1
-                c = c + np.array([x0, y0])
-                cv2.drawContours(anotada, [c], -1, (0, 255, 0), 2)
-                M = cv2.moments(c)
-                if M["m00"]:
-                    cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-                    cv2.putText(anotada, str(cantidad), (cx - 8, cy + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            if not (area_min <= area <= area_max):
+                continue
 
-        if ROI:
-            cv2.rectangle(anotada, (x0, y0), (x0 + ROI[2], y0 + ROI[3]), (255, 200, 0), 2)
+            _, _, bw, bh = cv2.boundingRect(c)
+            proporcion = max(bw, bh) / max(1, min(bw, bh))
+            solidez = area / max(1.0, cv2.contourArea(cv2.convexHull(c)))
+            if proporcion > 4.0 or solidez < 0.75:
+                continue
+
+            cantidad += 1
+            c = c + np.array([x0, y0])
+            cv2.drawContours(anotada, [c], -1, (0, 255, 0), 2)
+            M = cv2.moments(c)
+            if M["m00"]:
+                cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                cv2.putText(anotada, str(cantidad), (cx - 8, cy + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        cv2.rectangle(anotada, (x0, y0), (x0 + w, y0 + h), (255, 200, 0), 1)
         return cantidad, anotada, mascara
 
 
@@ -270,21 +304,43 @@ vibrador = VibradorBandeja()
 def dibujar_panel(img, entrada_objetivo):
     est, msg, color = estado.resultado()
     h, w = img.shape[:2]
-    cv2.rectangle(img, (0, 0), (w, 95), (30, 30, 30), -1)
-    cv2.putText(img, f"Objetivo: {estado.objetivo}", (15, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-    cv2.putText(img, f"Detectadas: {estado.detectadas}", (260, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-    cv2.putText(img, f"Diferencia: {estado.detectadas - estado.objetivo:+d}", (560, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-    cv2.putText(img, msg, (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+
+    # Escala base respecto a 1280px de ancho para que funcione en 640x480, 1280x720, etc.
+    escala = max(0.55, min(1.35, w / 1280.0))
+    alto_panel = max(65, int(95 * escala))
+    grosor = max(1, int(round(2 * escala)))
+    grosor_msg = max(2, int(round(3 * escala)))
+
+    cv2.rectangle(img, (0, 0), (w, alto_panel), (30, 30, 30), -1)
+
+    y_fila1 = int(alto_panel * 0.38)
+    y_fila2 = int(alto_panel * 0.84)
+
+    x_obj = int(w * 0.015)
+    x_det = int(w * 0.22)
+    x_dif = int(w * 0.45)
+
+    cv2.putText(img, f"Obj: {estado.objetivo}", (x_obj, y_fila1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85 * escala, (255, 255, 255), grosor)
+    cv2.putText(img, f"Det: {estado.detectadas}", (x_det, y_fila1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85 * escala, (255, 255, 255), grosor)
+    cv2.putText(img, f"Dif: {estado.detectadas - estado.objetivo:+d}", (x_dif, y_fila1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85 * escala, (255, 255, 255), grosor)
+
+    cv2.putText(img, msg, (x_obj, y_fila2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.95 * escala, color, grosor_msg)
+
     modo = "CAPTURA" if estado.congelado else "EN VIVO"
     umbral = "auto" if contador.umbral_manual is None else contador.umbral_manual
-    cv2.putText(img, f"{modo} | umbral: {umbral}", (w - 330, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    info_der = f"{modo} | umb:{umbral}"
+    (tw, _), _ = cv2.getTextSize(info_der, cv2.FONT_HERSHEY_SIMPLEX, 0.58 * escala, 1)
+    cv2.putText(img, info_der, (max(x_dif, w - tw - int(w * 0.015)), y_fila2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58 * escala, (200, 200, 200), 1)
+
     if entrada_objetivo:
-        cv2.putText(img, f"Nuevo objetivo: {entrada_objetivo}_  (Enter)", (15, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(img, f"Nuevo objetivo: {entrada_objetivo}_  (Enter)",
+                    (x_obj, h - max(15, int(20 * escala))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75 * escala, (0, 255, 255), grosor)
     return img
 
 
