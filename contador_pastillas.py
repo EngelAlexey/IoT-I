@@ -89,34 +89,21 @@ def ultimos_registros(n=20):
 # ------------------------------------------------------------------------------------------------
 class Camara:
     def __init__(self):
+        self.picam2 = None
+        self.cap = None
         if USAR_PICAMERA:
             self.picam2 = Picamera2()
             config = self.picam2.create_video_configuration(
-                main={"size": RESOLUCION, "format": "RGB888"})
+                main={"size": RESOLUCION, "format": "BGR888"},
+                buffer_count=2
+            )
             self.picam2.configure(config)
             self.picam2.start()
-            try:
-                self.picam2.set_controls({"AfMode": 2})
-            except Exception as e:
-                print(f"Nota sobre autofocus: {e}")
-            time.sleep(2)
+            time.sleep(1.5)
         else:
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUCION[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUCION[1])
-
-    def leer(self):
-        if USAR_PICAMERA:
-            return self.picam2.capture_array()
-        ok, frame = self.cap.read()
-        return frame if ok else None
-
-    def cerrar(self):
-        if USAR_PICAMERA:
-            self.picam2.stop()
-        else:
-            self.cap.release()
-
 
 # ------------------------------------------------------------------------------------------------
 # Vibración de bandeja con 2 servos SG90
