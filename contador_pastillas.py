@@ -6,7 +6,7 @@
 # Software : Python 3, Picamera2, OpenCV, Flask, SQLite, gpiozero
 #
 # Uso:
-#   python3 contador_pastillas.py
+#   python3 -u contador_pastillas.py
 #   - En el monitor de la Raspberry: ventana con el video y el conteo (teclas abajo).
 #   - Desde la red: http://<ip de la raspberry>:5000
 #
@@ -41,7 +41,7 @@ except ImportError:
 # ------------------------------------------------------------------------------------------------
 # Configuración (calibrar con la bandeja, iluminación y montaje de servos reales)
 # ------------------------------------------------------------------------------------------------
-RESOLUCION = (640, 480)      # Más estable en Raspberry Pi 4 + cámara rev 1.3 (puedes subir a 800x600)
+RESOLUCION = (640, 480)      # Estable en Raspberry Pi 4 + cámara rev 1.3 (puedes probar 800x600)
 ROI = None                   # Región de la bandeja (x, y, ancho, alto). None = usa MARGEN_BORDE
 MARGEN_BORDE = 0.06          # Ignora el 6% de los bordes si ROI es None
 FONDO_OSCURO = True          # True: pastillas claras sobre fondo oscuro/mate
@@ -101,16 +101,16 @@ class Camara:
                 self.picam2.configure(config)
                 self.picam2.start()
                 time.sleep(1.5)
-                print(f"[Camara] Picamera2 iniciada a {RESOLUCION}")
+                print(f"[Camara] Picamera2 iniciada a {RESOLUCION}", flush=True)
             except Exception as e:
-                print(f"[ERROR Camara] Falló Picamera2: {e}")
+                print(f"[ERROR Camara] Falló Picamera2: {e}", flush=True)
                 self.picam2 = None
 
         if self.picam2 is None:
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUCION[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUCION[1])
-            print(f"[Camara] Usando VideoCapture(0) a {RESOLUCION}")
+            print(f"[Camara] Usando VideoCapture(0) a {RESOLUCION}", flush=True)
 
     def leer(self):
         """Captura y devuelve un frame en formato BGR de OpenCV."""
@@ -121,7 +121,7 @@ class Camara:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 return frame
             except Exception as e:
-                print(f"[WARN Camara] Error al leer frame de Picamera2: {e}")
+                print(f"[WARN Camara] Error al leer frame de Picamera2: {e}", flush=True)
                 return None
         elif self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
@@ -163,7 +163,7 @@ class VibradorBandeja:
                     s.angle = 0
                     self.servos.append(s)
                 except Exception as e:
-                    print(f"Aviso servo en GPIO {pin}: {e}")
+                    print(f"Aviso servo en GPIO {pin}: {e}", flush=True)
             if self.servos:
                 time.sleep(0.2)
                 for s in self.servos:
@@ -393,11 +393,15 @@ def ejecutar_captura_con_vibracion(cam):
 
 
 def bucle_camara():
+    with estado.lock:
+        estado.congelado = False
+        estado.solicitar_captura = False
+
     cam = Camara()
     entrada = ""
-    ultimo = frame_sin_senal()
+    ultimo = None
 
-    ok_init, buf_init = cv2.imencode(".jpg", ultimo, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    ok_init, buf_init = cv2.imencode(".jpg", frame_sin_senal(), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     if ok_init:
         with estado.lock:
             estado.jpeg = buf_init.tobytes()
@@ -414,13 +418,14 @@ def bucle_camara():
                 pedida = estado.solicitar_captura
                 if pedida:
                     estado.solicitar_captura = False
+                congelado_actual = estado.congelado
 
             if pedida:
                 captura = ejecutar_captura_con_vibracion(cam)
                 if captura is not None:
                     ultimo = captura
 
-            if not estado.congelado:
+            if not congelado_actual or ultimo is None:
                 frame = cam.leer()
                 if frame is not None:
                     cantidad, anotada, _ = contador.contar(frame)
@@ -428,9 +433,19 @@ def bucle_camara():
                     with estado.lock:
                         estado.detectadas = int(np.median(estado.historial))
                     ultimo = anotada
-                else:
-                    ultimo = frame_sin_senal()
+                elif ultimo is None:
+                    vista_espera = dibujar_panel(frame_sin_senal(), entrada)
+                    ok_e, buf_e = cv2.imencode(".jpg", vista_espera, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if ok_e:
+                        with estado.lock:
+                            estado.jpeg = buf_e.tobytes()
+                            estado.frame_id += 1
+                    if MOSTRAR_EN_MONITOR:
+                        cv2.imshow("SmartPill Counter", vista_espera)
+                        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                            break
                     time.sleep(0.05)
+                    continue
 
             vista = dibujar_panel(ultimo.copy(), entrada)
             ok, buf = cv2.imencode(".jpg", vista, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
@@ -456,7 +471,8 @@ def bucle_camara():
                     if captura is not None:
                         ultimo = captura
                 elif tecla == ord("r"):
-                    estado.congelado = False
+                    with estado.lock:
+                        estado.congelado = False
                 elif tecla == ord("+"):
                     contador.umbral_manual = min(255, (contador.umbral_manual or 127) + 5)
                 elif tecla == ord("-"):
@@ -466,7 +482,7 @@ def bucle_camara():
                 elif tecla == ord("s"):
                     est, _, _ = estado.resultado()
                     guardar_registro(estado.objetivo, estado.detectadas, est)
-                    print(f"Registro guardado: {estado.objetivo} / {estado.detectadas} ({est})")
+                    print(f"Registro guardado: {estado.objetivo} / {estado.detectadas} ({est})", flush=True)
             else:
                 time.sleep(0.03)
     finally:
@@ -493,7 +509,8 @@ PAGINA = """
  table{margin:20px auto;border-collapse:collapse} td,th{border:1px solid #45475a;padding:4px 10px}
 </style></head><body>
 <h1>SmartPill Counter</h1>
-<img id="stream" src="/video_feed" alt="Camara">
+<img id="stream" src="/video_feed" alt="Camara"
+ onerror="setTimeout(()=>{ this.src='/video_feed?t='+Date.now(); }, 800);">
 <div class="datos">
  <div>Objetivo: <b id="obj">-</b></div><div>Detectadas: <b id="det">-</b></div>
  <div>Diferencia: <b id="dif">-</b></div></div>
@@ -581,7 +598,8 @@ def api_capturar():
 
 @app.route("/vivo", methods=["POST"])
 def api_vivo():
-    estado.congelado = False
+    with estado.lock:
+        estado.congelado = False
     return jsonify(ok=True)
 
 
