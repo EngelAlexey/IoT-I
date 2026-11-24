@@ -87,6 +87,9 @@ def ultimos_registros(n=20):
 # ------------------------------------------------------------------------------------------------
 # Cámara
 # ------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
+# Cámara
+# ------------------------------------------------------------------------------------------------
 class Camara:
     def __init__(self):
         self.picam2 = None
@@ -104,6 +107,31 @@ class Camara:
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUCION[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUCION[1])
+
+    def leer(self):
+        """Captura y devuelve un frame en formato BGR de OpenCV."""
+        if USAR_PICAMERA and self.picam2:
+            # Picamera2 devuelve el frame en BGR888 configurado previamente
+            return self.picam2.capture_array()
+        elif self.cap:
+            ret, frame = self.cap.read()
+            if ret:
+                return frame
+        return None
+
+    def cerrar(self):
+        """Libera los recursos de la cámara de forma segura."""
+        if USAR_PICAMERA and self.picam2:
+            try:
+                self.picam2.stop()
+                self.picam2.close()
+            except Exception:
+                pass
+        elif self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------------------------
 # Vibración de bandeja con 2 servos SG90
