@@ -42,26 +42,21 @@ except ImportError:
 # Configuración (calibrar con la bandeja, iluminación y montaje de servos reales)
 # ------------------------------------------------------------------------------------------------
 RESOLUCION = (1280, 720)
-ROI = None                   # Región de la bandeja (x, y, ancho, alto). None = imagen completa
-FONDO_OSCURO = True          # True: pastillas claras sobre bandeja oscura/mate
-AREA_MIN = 300               # Área mínima en píxeles de una pastilla (descarta polvo y ruido)
-AREA_MAX = 20000             # Área máxima de un grupo de pastillas
-SEPARACION_WATERSHED = 0.6   # 0.4-0.8: más alto separa más agresivamente pastillas pegadas
+ROI = None                   # Región de la bandeja (x, y, ancho, alto). None = usa MARGEN_BORDE
+MARGEN_BORDE = 0.06          # Ignora el 6% de los bordes si ROI es None
+FONDO_OSCURO = True          # True: pastillas claras sobre fondo oscuro/mate
+AREA_MIN_BASE = 180          # Calibrado para 640x480 (se escala automáticamente a RESOLUCION)
+AREA_MAX_BASE = 12000        # Área máxima de un grupo de pastillas en 640x480
+SEPARACION_WATERSHED = 0.55  # 0.4-0.8: más alto separa más agresivamente pastillas pegadas
 LECTURAS_ESTABLES = 5        # Mediana de N cuadros para evitar parpadeo del conteo
 DB = "smartpill.db"
 MOSTRAR_EN_MONITOR = True    # Ventana OpenCV en el monitor HDMI
+ANCHO_VENTANA = 960          # None para tamaño original; ej. 960 para ajustar en pantalla
+ALTO_VENTANA = 540
 
 PINES_SERVO = [18, 13]       # Servo 1 en GPIO 18 (pin físico 12) y Servo 2 en GPIO 13 (pin físico 33)
 CICLOS_VIBRACION = 6         # Cantidad de sacudidas rápidas antes de contar
 AMPLITUD_VIBRACION = 15      # Grados de giro a cada lado (ajustar según el soporte)
-
-# Configuración mejorada
-ROI = None                   # O ej. (60, 40, 520, 360) para recortar solo la bandeja
-MARGEN_BORDE = 0.06          # Ignora el 6% de los bordes si ROI es None
-FONDO_OSCURO = True          # True: pastillas claras sobre fondo oscuro/mate
-AREA_MIN_BASE = 180          # Calibrado para 640x480 (se escala solo en 1280x720)
-AREA_MAX_BASE = 12000
-SEPARACION_WATERSHED = 0.55
 
 
 # ------------------------------------------------------------------------------------------------
@@ -207,7 +202,7 @@ class Contador:
         gris = cv2.cvtColor(zona, cv2.COLOR_BGR2GRAY)
         gris = cv2.GaussianBlur(gris, (5, 5), 0)
 
-        # 2. Top-Hat morfológico: elimina iluminación desigual y resalta solo objetos pequeños
+        # 2. Top-Hat / Black-Hat morfológico para aislar pastillas de fondos irregulares
         kernel_luz = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
         if FONDO_OSCURO:
             realce = cv2.morphologyEx(gris, cv2.MORPH_TOPHAT, kernel_luz)
@@ -285,6 +280,7 @@ class Estado:
         self.congelado = False
         self.solicitar_captura = False
         self.jpeg = None
+        self.frame_id = 0
         self.historial = []
 
     def resultado(self):
@@ -305,7 +301,6 @@ def dibujar_panel(img, entrada_objetivo):
     est, msg, color = estado.resultado()
     h, w = img.shape[:2]
 
-    # Escala base respecto a 1280px de ancho para que funcione en 640x480, 1280x720, etc.
     escala = max(0.55, min(1.35, w / 1280.0))
     alto_panel = max(65, int(95 * escala))
     grosor = max(1, int(round(2 * escala)))
@@ -367,11 +362,20 @@ def bucle_camara():
     cam = Camara()
     entrada = ""
     ultimo = None
+
+    if MOSTRAR_EN_MONITOR:
+        cv2.namedWindow("SmartPill Counter", cv2.WINDOW_NORMAL)
+        if ANCHO_VENTANA and ALTO_VENTANA:
+            cv2.resizeWindow("SmartPill Counter", ANCHO_VENTANA, ALTO_VENTANA)
+
     try:
         while True:
-            if estado.solicitar_captura:
-                with estado.lock:
+            with estado.lock:
+                pedida = estado.solicitar_captura
+                if pedida:
                     estado.solicitar_captura = False
+
+            if pedida:
                 captura = ejecutar_captura_con_vibracion(cam)
                 if captura is not None:
                     ultimo = captura
@@ -389,7 +393,9 @@ def bucle_camara():
             vista = dibujar_panel(ultimo.copy(), entrada)
             ok, buf = cv2.imencode(".jpg", vista, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
-                estado.jpeg = buf.tobytes()
+                with estado.lock:
+                    estado.jpeg = buf.tobytes()
+                    estado.frame_id += 1
 
             if MOSTRAR_EN_MONITOR:
                 cv2.imshow("SmartPill Counter", vista)
@@ -485,11 +491,28 @@ def index():
 @app.route("/video_feed")
 def video_feed():
     def generar():
+        ultimo_id = -1
         while True:
-            if estado.jpeg:
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + estado.jpeg + b"\r\n")
-            time.sleep(0.05)
-    return Response(generar(), mimetype="multipart/x-mixed-replace; boundary=frame")
+            with estado.lock:
+                frame_bytes = estado.jpeg
+                actual_id = estado.frame_id
+
+            if frame_bytes is not None and actual_id != ultimo_id:
+                ultimo_id = actual_id
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n"
+                    + frame_bytes
+                    + b"\r\n"
+                )
+            time.sleep(0.04)
+
+    return Response(
+        generar(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 
 @app.route("/estado")
@@ -537,4 +560,3 @@ if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000, debug=False,
                                             use_reloader=False), daemon=True).start()
     bucle_camara()
-    
